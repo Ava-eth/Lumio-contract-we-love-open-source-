@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.21;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
@@ -23,11 +23,30 @@ contract LumioMarketplace is Ownable, ReentrancyGuard, Pausable, IERC721Receiver
     // =============================================================
     // 🧩 VARIABLES
     // =============================================================
-    address public constant FACTORY_ADDRESS = 0x445C9Eb92Ae7451144C6d32068274fBd8d1d6bcD;
-    INFTCollectionFactory public factory = INFTCollectionFactory(FACTORY_ADDRESS);
+    address public constant FACTORY_ADDRESS = 0x8fF81e2A79975936ba7856BB09B79C45E2B702C9;
+    INFTCollectionFactory public constant factory = INFTCollectionFactory(FACTORY_ADDRESS);
 
     uint256 public marketplaceFee = 250; // 2.5%
     address public treasury;
+
+    // ✅ Added allowlist tracking for collections
+    mapping(address => bool) public allowedCollections;
+    
+    // ============ Timelock Variables ============
+    uint256 public constant TIMELOCK_DELAY = 2 days;
+    
+    struct TimelockProposal {
+        uint256 newFee;
+        address newTreasury;
+        address collection;
+        bool allowStatus;
+        uint8 proposalType; // 1=fee, 2=treasury, 3=collection
+        uint256 executeAfter;
+        bool executed;
+        bool cancelled;
+    }
+    
+    mapping(bytes32 => TimelockProposal) public proposals;
 
     struct Listing {
         address collection;
@@ -68,11 +87,17 @@ contract LumioMarketplace is Ownable, ReentrancyGuard, Pausable, IERC721Receiver
     event AuctionEnded(address indexed collection, uint256 indexed tokenId, address winner, uint256 amount);
     event AuctionCancelled(address indexed collection, uint256 indexed tokenId);
     event Withdrawal(address indexed user, uint256 amount);
+    event AdminDustWithdrawn(address indexed to, uint256 amount);
+    event CollectionAllowed(address indexed collection, bool allowed);
+    event ProposalCreated(bytes32 indexed proposalId, uint8 proposalType, uint256 executeAfter);
+    event ProposalExecuted(bytes32 indexed proposalId);
+    event ProposalCancelled(bytes32 indexed proposalId);
 
     // =============================================================
     // ⚙️ CONSTRUCTOR
     // =============================================================
     constructor(address _treasury) Ownable(msg.sender) {
+        require(_treasury != address(0), "Invalid treasury");
         treasury = _treasury;
     }
 
@@ -95,10 +120,10 @@ contract LumioMarketplace is Ownable, ReentrancyGuard, Pausable, IERC721Receiver
         address allowedBuyer
     ) external nonReentrant whenNotPaused {
         require(price > 0, "Invalid price");
+        require(allowedCollections[collection], "Collection not allowed"); // ✅ H3 fix
         IERC721 nft = IERC721(collection);
         require(nft.ownerOf(tokenId) == msg.sender, "Not owner");
 
-        // Transfer NFT to marketplace escrow
         nft.safeTransferFrom(msg.sender, address(this), tokenId);
 
         listings[collection][tokenId] = Listing({
@@ -122,12 +147,15 @@ contract LumioMarketplace is Ownable, ReentrancyGuard, Pausable, IERC721Receiver
         listing.active = false;
         IERC721(collection).safeTransferFrom(address(this), msg.sender, tokenId);
         emit NFTDelisted(collection, tokenId);
+
+        // ✅ M3: Documented policy – delistNFT is intentionally allowed during pause for safe recovery.
     }
 
     function buyNFT(address collection, uint256 tokenId) external payable nonReentrant whenNotPaused {
         Listing storage listing = listings[collection][tokenId];
         require(listing.active, "Not for sale");
         require(msg.value >= listing.price, "Insufficient payment");
+        require(allowedCollections[collection], "Collection not allowed"); // ✅ verify collection
 
         if (listing.isPrivate) require(msg.sender == listing.allowedBuyer, "Not allowed buyer");
         listing.active = false;
@@ -153,6 +181,12 @@ contract LumioMarketplace is Ownable, ReentrancyGuard, Pausable, IERC721Receiver
         // Pay seller
         _safeTransferETH(listing.seller, sellerProceeds);
 
+        // ✅ C1: Refund overpayment if any
+        if (msg.value > listing.price) {
+            uint256 excess = msg.value - listing.price;
+            _safeTransferETH(msg.sender, excess);
+        }
+
         emit NFTSold(collection, tokenId, msg.sender, listing.price);
     }
 
@@ -167,12 +201,12 @@ contract LumioMarketplace is Ownable, ReentrancyGuard, Pausable, IERC721Receiver
         bool isPrivate,
         address allowedBidder
     ) external nonReentrant whenNotPaused {
+        require(allowedCollections[collection], "Collection not allowed");
         IERC721 nft = IERC721(collection);
         require(nft.ownerOf(tokenId) == msg.sender, "Not owner");
         require(minBid > 0, "Invalid bid");
         uint256 endTime = block.timestamp + duration;
 
-        // Transfer NFT to escrow
         nft.safeTransferFrom(msg.sender, address(this), tokenId);
 
         auctions[collection][tokenId] = Auction({
@@ -199,7 +233,6 @@ contract LumioMarketplace is Ownable, ReentrancyGuard, Pausable, IERC721Receiver
 
         if (auction.isPrivate) require(msg.sender == auction.allowedBidder, "Not allowed");
 
-        // Refund previous highest bidder
         if (auction.highestBidder != address(0)) {
             pendingWithdrawals[auction.highestBidder] += auction.highestBid;
         }
@@ -221,7 +254,8 @@ contract LumioMarketplace is Ownable, ReentrancyGuard, Pausable, IERC721Receiver
         emit AuctionCancelled(collection, tokenId);
     }
 
-    function endAuction(address collection, uint256 tokenId) external nonReentrant whenNotPaused {
+    // ✅ M4: endAuction allowed even if paused (fail-safe)
+    function endAuction(address collection, uint256 tokenId) external nonReentrant {
         Auction storage auction = auctions[collection][tokenId];
         require(auction.active, "No auction");
         require(block.timestamp >= auction.endTime, "Not ended yet");
@@ -229,13 +263,11 @@ contract LumioMarketplace is Ownable, ReentrancyGuard, Pausable, IERC721Receiver
         auction.active = false;
 
         if (auction.highestBidder == address(0)) {
-            // No bids — return NFT to seller
             IERC721(collection).safeTransferFrom(address(this), auction.seller, tokenId);
             emit AuctionEnded(collection, tokenId, address(0), 0);
             return;
         }
 
-        // Handle royalty & fees
         uint256 royaltyAmount;
         address royaltyReceiver;
         try IRoyaltyInfo(collection).royaltyInfo(tokenId, auction.highestBid) returns (address receiver, uint256 amount) {
@@ -265,86 +297,222 @@ contract LumioMarketplace is Ownable, ReentrancyGuard, Pausable, IERC721Receiver
         emit Withdrawal(msg.sender, amount);
     }
 
+    // ✅ M5: Admin dust withdraw
+    function withdrawDust(address to) external onlyOwner nonReentrant {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "No dust");
+        _safeTransferETH(to, balance);
+        emit AdminDustWithdrawn(to, balance);
+    }
+
     // =============================================================
     // 🧭 QUERY HELPERS
     // =============================================================
     function getFactoryCollections() external view returns (address[] memory) {
         return factory.getDeployedCollections();
     }
-
-    function getNFTDetails(address collection, uint256 tokenId)
-        external
-        view
-        returns (
-            address owner,
-            uint256 price,
-            bool active,
-            string memory metadataURI,
-            string memory formattedPrice
-        )
-    {
-        IERC721 nft = IERC721(collection);
-        if (listings[collection][tokenId].active) owner = address(this);
-        else owner = nft.ownerOf(tokenId);
-
-        price = listings[collection][tokenId].price;
-        active = listings[collection][tokenId].active;
-
+    
+    /// @notice Get the token URI for a specific NFT from its collection
+    /// @param collection The NFT collection address
+    /// @param tokenId The token ID
+    /// @return The token URI string (returns empty string if not supported)
+    function getTokenURI(address collection, uint256 tokenId) external view returns (string memory) {
         try IERC721Metadata(collection).tokenURI(tokenId) returns (string memory uri) {
-            metadataURI = uri;
+            return uri;
         } catch {
-            metadataURI = "ipfs://QmDefaultLumioLogo";
+            return "";
         }
-
-        formattedPrice = _formatPrice(price);
+    }
+    
+    /// @notice Get listing details with token URI
+    /// @param collection The NFT collection address
+    /// @param tokenId The token ID
+    /// @return listing The listing details
+    /// @return tokenURI The token metadata URI
+    function getListingWithURI(address collection, uint256 tokenId) 
+        external 
+        view 
+        returns (Listing memory listing, string memory tokenURI) 
+    {
+        listing = listings[collection][tokenId];
+        try IERC721Metadata(collection).tokenURI(tokenId) returns (string memory uri) {
+            tokenURI = uri;
+        } catch {
+            tokenURI = "";
+        }
+    }
+    
+    /// @notice Get auction details with token URI
+    /// @param collection The NFT collection address
+    /// @param tokenId The token ID
+    /// @return auction The auction details
+    /// @return tokenURI The token metadata URI
+    function getAuctionWithURI(address collection, uint256 tokenId) 
+        external 
+        view 
+        returns (Auction memory auction, string memory tokenURI) 
+    {
+        auction = auctions[collection][tokenId];
+        try IERC721Metadata(collection).tokenURI(tokenId) returns (string memory uri) {
+            tokenURI = uri;
+        } catch {
+            tokenURI = "";
+        }
+    }
+    
+    /// @notice Get collection name and symbol
+    /// @param collection The NFT collection address
+    /// @return name The collection name
+    /// @return symbol The collection symbol
+    function getCollectionInfo(address collection) 
+        external 
+        view 
+        returns (string memory name, string memory symbol) 
+    {
+        try IERC721Metadata(collection).name() returns (string memory _name) {
+            name = _name;
+        } catch {
+            name = "";
+        }
+        
+        try IERC721Metadata(collection).symbol() returns (string memory _symbol) {
+            symbol = _symbol;
+        } catch {
+            symbol = "";
+        }
     }
 
     // =============================================================
     // 🧮 INTERNAL UTILITIES
     // =============================================================
     function _safeTransferETH(address to, uint256 amount) internal {
+        if (amount == 0) return;
         (bool success, ) = payable(to).call{value: amount}("");
         require(success, "ETH transfer failed");
-    }
-
-    function _formatPrice(uint256 weiAmount) internal pure returns (string memory) {
-        if (weiAmount == 0) return "0 ETH";
-        uint256 ethWhole = weiAmount / 1e18;
-        uint256 ethDecimals = (weiAmount % 1e18) / 1e14;
-
-        return string(abi.encodePacked(_uintToString(ethWhole), ".", _uintToString(ethDecimals), " ETH"));
-    }
-
-    function _uintToString(uint256 v) internal pure returns (string memory) {
-        if (v == 0) return "0";
-        uint256 j = v;
-        uint256 len;
-        while (j != 0) {
-            len++;
-            j /= 10;
-        }
-        bytes memory bstr = new bytes(len);
-        uint256 k = len;
-        j = v;
-        while (j != 0) {
-            bstr[--k] = bytes1(uint8(48 + (j % 10)));
-            j /= 10;
-        }
-        return string(bstr);
     }
 
     // =============================================================
     // 🛠️ ADMIN FUNCTIONS
     // =============================================================
-    function updateFee(uint256 newFee) external onlyOwner {
+    
+    // ============ Timelock Functions ============
+    
+    /// @notice Propose marketplace fee change (requires 2-day delay)
+    function proposeFeeChange(uint256 newFee) external onlyOwner returns (bytes32) {
         require(newFee <= 1000, "Max 10%");
-        marketplaceFee = newFee;
+        bytes32 proposalId = keccak256(abi.encode(newFee, block.timestamp, "fee"));
+        require(proposals[proposalId].executeAfter == 0, "Proposal already exists");
+        
+        proposals[proposalId] = TimelockProposal({
+            newFee: newFee,
+            newTreasury: address(0),
+            collection: address(0),
+            allowStatus: false,
+            proposalType: 1,
+            executeAfter: block.timestamp + TIMELOCK_DELAY,
+            executed: false,
+            cancelled: false
+        });
+        
+        emit ProposalCreated(proposalId, 1, block.timestamp + TIMELOCK_DELAY);
+        return proposalId;
     }
-
-    function updateTreasury(address newTreasury) external onlyOwner {
+    
+    /// @notice Execute fee change after timelock expires
+    function executeFeeChange(bytes32 proposalId) external onlyOwner {
+        TimelockProposal storage proposal = proposals[proposalId];
+        require(proposal.proposalType == 1, "Not a fee proposal");
+        require(!proposal.executed, "Already executed");
+        require(!proposal.cancelled, "Proposal cancelled");
+        require(block.timestamp >= proposal.executeAfter, "Timelock not expired");
+        
+        proposal.executed = true;
+        marketplaceFee = proposal.newFee;
+        
+        emit ProposalExecuted(proposalId);
+    }
+    
+    /// @notice Propose treasury change (requires 2-day delay)
+    function proposeTreasuryChange(address newTreasury) external onlyOwner returns (bytes32) {
         require(newTreasury != address(0), "Invalid");
-        treasury = newTreasury;
+        bytes32 proposalId = keccak256(abi.encode(newTreasury, block.timestamp, "treasury"));
+        require(proposals[proposalId].executeAfter == 0, "Proposal already exists");
+        
+        proposals[proposalId] = TimelockProposal({
+            newFee: 0,
+            newTreasury: newTreasury,
+            collection: address(0),
+            allowStatus: false,
+            proposalType: 2,
+            executeAfter: block.timestamp + TIMELOCK_DELAY,
+            executed: false,
+            cancelled: false
+        });
+        
+        emit ProposalCreated(proposalId, 2, block.timestamp + TIMELOCK_DELAY);
+        return proposalId;
     }
+    
+    /// @notice Execute treasury change after timelock expires
+    function executeTreasuryChange(bytes32 proposalId) external onlyOwner {
+        TimelockProposal storage proposal = proposals[proposalId];
+        require(proposal.proposalType == 2, "Not a treasury proposal");
+        require(!proposal.executed, "Already executed");
+        require(!proposal.cancelled, "Proposal cancelled");
+        require(block.timestamp >= proposal.executeAfter, "Timelock not expired");
+        
+        proposal.executed = true;
+        treasury = proposal.newTreasury;
+        
+        emit ProposalExecuted(proposalId);
+    }
+    
+    /// @notice Propose collection allowlist change (requires 2-day delay)
+    function proposeCollectionAllowlistChange(address collection, bool allowed) external onlyOwner returns (bytes32) {
+        bytes32 proposalId = keccak256(abi.encode(collection, allowed, block.timestamp));
+        require(proposals[proposalId].executeAfter == 0, "Proposal already exists");
+        
+        proposals[proposalId] = TimelockProposal({
+            newFee: 0,
+            newTreasury: address(0),
+            collection: collection,
+            allowStatus: allowed,
+            proposalType: 3,
+            executeAfter: block.timestamp + TIMELOCK_DELAY,
+            executed: false,
+            cancelled: false
+        });
+        
+        emit ProposalCreated(proposalId, 3, block.timestamp + TIMELOCK_DELAY);
+        return proposalId;
+    }
+    
+    /// @notice Execute collection allowlist change after timelock expires
+    function executeCollectionAllowlistChange(bytes32 proposalId) external onlyOwner {
+        TimelockProposal storage proposal = proposals[proposalId];
+        require(proposal.proposalType == 3, "Not a collection proposal");
+        require(!proposal.executed, "Already executed");
+        require(!proposal.cancelled, "Proposal cancelled");
+        require(block.timestamp >= proposal.executeAfter, "Timelock not expired");
+        
+        proposal.executed = true;
+        allowedCollections[proposal.collection] = proposal.allowStatus;
+        
+        emit ProposalExecuted(proposalId);
+        emit CollectionAllowed(proposal.collection, proposal.allowStatus);
+    }
+    
+    /// @notice Cancel a pending proposal (emergency only)
+    function cancelProposal(bytes32 proposalId) external onlyOwner {
+        TimelockProposal storage proposal = proposals[proposalId];
+        require(!proposal.executed, "Already executed");
+        require(!proposal.cancelled, "Already cancelled");
+        
+        proposal.cancelled = true;
+        emit ProposalCancelled(proposalId);
+    }
+    
+    // ============ Emergency Pause Functions ============
 
     function pause() external onlyOwner {
         _pause();
@@ -361,4 +529,3 @@ contract LumioMarketplace is Ownable, ReentrancyGuard, Pausable, IERC721Receiver
         return IERC721Receiver.onERC721Received.selector;
     }
 }
-
